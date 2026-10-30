@@ -1,5 +1,5 @@
 #include "strategy.hpp"
-#include "model.hpp"
+#include "search.hpp"
 #include "conv.hpp"
 
 #include <cmath>
@@ -200,93 +200,34 @@ std::vector<Partition> generate_core_partitions(const Graph& g, const MatmulGrid
     return result;
 }
 
-Cost mandatory_bytes(const Graph& g) {
-    Cost result = 0;
-    for (const auto& t : g.tensors) {
-        bool producer = false, consumer = false, output = false;
-        for (int op : t.producers) producer = producer || !g.ops[op].copy;
-        for (int op : t.consumers) {
-            consumer = consumer || !g.ops[op].copy; output = output || g.ops[op].copy == 2;
-        }
-        if ((!producer && consumer) || (producer && (output || !consumer))) {
-            if (result > kInfinity - t.bytes) return kInfinity;
-            result += t.bytes;
-        }
+// 复用已识别的链，按计算量均衡分核。
+void try_load_balanced_plans(const Graph& g, const MatmulGrid& grid, int cores, PlanSearchState& state) {
+    const auto& chains = grid.chains;
+    std::vector<Cost> weights(chains.size());
+    std::vector<int> first(chains.size()), sorted(chains.size());
+    std::iota(sorted.begin(), sorted.end(), 0);
+    for (int i : sorted) {
+        first[i] = *std::min_element(chains[i].begin(), chains[i].end());
+        for (int op : chains[i]) weights[i] += std::max<Cost>(1, g.ops[op].cycles);
     }
-    return result;
-}
-
-// 保存评估次数、已试方案和最优结果；构造时只初始化这些记录。
-struct PlanSearchState {
-    const Graph& graph;
-    Cost time_lower_bound, minimum_copy_bytes;
-    Plan best_plan;
-    Evaluation best_score;
-    std::set<std::pair<std::uint64_t, std::uint64_t>> tried_plan_hashes;
-    int evaluated_count = 0, max_evaluations;
-    explicit PlanSearchState(const Graph& g, int cores) : graph(g), time_lower_bound(universal_lower_bound(g, cores)),
-        minimum_copy_bytes(mandatory_bytes(g)),
-        max_evaluations(static_cast<int>(std::min<std::size_t>(640, std::max<std::size_t>(12, 9000000 / std::max<std::size_t>(1, g.work.size()))))) {}
-
-    // 次数用完，或时间和搬运量都达到下界时停止。
-    bool should_stop() const {
-        return evaluated_count >= max_evaluations ||
-               (best_score.valid && best_score.makespan == time_lower_bound && best_score.bytes == minimum_copy_bytes);
-    }
-    // 去重、剪枝、预测性能，并更新当前最优方案。
-    Evaluation evaluate_candidate(const Plan& plan) {
-        Evaluation result;
-        if (should_stop()) return result;
-        std::uint64_t a = 1469598103934665603ULL, b = 0x9e3779b97f4a7c15ULL;
-        for (const auto& core : plan.orders) {
-            a = (a ^ UINT64_MAX) * 1099511628211ULL;
-            b = b * 6364136223846793005ULL + core.size();
-            for (int op : core) { a = (a ^ static_cast<std::uint64_t>(op)) * 1099511628211ULL; b = (b ^ a) * 2862933555777941757ULL + 3037000493ULL; }
-        }
-        if (!tried_plan_hashes.emplace(a, b).second) return result;
-        if (partition_lower_bound(graph, plan) > best_score.makespan) return result;
-        ++evaluated_count;
-        result = evaluate(graph, plan, best_score.makespan);
-        if (result.valid && (!best_score.valid ||
-            std::tie(result.makespan, result.bytes, plan.orders) < std::tie(best_score.makespan, best_score.bytes, best_plan.orders))) {
-            best_score = result; best_plan = plan;
-            // 已接近时间下界时，缩减后续评估次数。
-            if (static_cast<double>(best_score.makespan - time_lower_bound) <= 0.005 * static_cast<double>(best_score.makespan))
-                max_evaluations = std::min(max_evaluations, std::max(24, evaluated_count + 8));
-        }
-        return result;
-    }
-};
-
-// 按独立依赖分量均衡分核，补充 Matmul 的候选方案。
-void try_load_balanced_plans(const Graph& g, int cores, PlanSearchState& state) {
-    std::vector<int> component(g.ops.size(), -1);
-    std::vector<std::vector<int>> groups;
-    for (int root : g.work) if (component[root] < 0) {
-        const int id = static_cast<int>(groups.size());
-        std::vector<int> queue{root}; component[root] = id;
-        for (std::size_t i = 0; i < queue.size(); ++i) {
-            const int op = queue[i];
-            for (const auto* list : {&g.pred[op], &g.succ[op]}) for (int v : *list)
-                if (component[v] < 0) { component[v] = id; queue.push_back(v); }
-        }
-        groups.push_back(std::move(queue));
-    }
-    std::vector<Cost> weights(groups.size());
-    std::vector<int> sorted(groups.size()); std::iota(sorted.begin(), sorted.end(), 0);
-    for (int i : sorted) for (int op : groups[i]) weights[i] += std::max<Cost>(1, g.ops[op].cycles);
-    std::stable_sort(sorted.begin(), sorted.end(), [&](int a, int b) { return weights[a] > weights[b]; });
+    // 同重链仍按原图最早出现的操作排序，保留原有平局规则。
+    std::sort(sorted.begin(), sorted.end(), [&](int a, int b) {
+        return weights[a] != weights[b] ? weights[a] > weights[b] : first[a] < first[b];
+    });
     const auto dfs = dependency_order(g, true);
     for (int q : {1, cores, std::max(1, cores - 1)}) {
+        if (state.should_stop()) return;
         std::vector<Cost> load(q);
-        std::vector<int> owner(groups.size());
-        for (int group : sorted) {
+        std::vector<int> owner(g.ops.size(), -1);
+        for (int chain : sorted) {
             const int core = static_cast<int>(std::min_element(load.begin(), load.end()) - load.begin());
-            owner[group] = core; load[core] += weights[group];
+            for (int op : chains[chain]) owner[op] = core;
+            load[core] += weights[chain];
         }
         for (const auto* order : {&dfs, &g.topo}) {
+            if (state.should_stop()) return;
             Plan plan; plan.orders.resize(cores);
-            for (int op : *order) plan.orders[owner[component[op]]].push_back(op);
+            for (int op : *order) plan.orders[owner[op]].push_back(op);
             state.evaluate_candidate(plan);
         }
     }
@@ -296,19 +237,23 @@ void try_load_balanced_plans(const Graph& g, int cores, PlanSearchState& state) 
 void try_tiled_matmul_plans(const Graph& g, const MatmulGrid& grid, int cores, PlanSearchState& state) {
     // 先试单核，搬运占主导时多核未必更快。
     const Partition single{{Rectangle{0, grid.rows, 0, grid.columns}}};
-    for (const auto& shape : std::vector<std::pair<int, int>>{{grid.rows, grid.columns}, {4, 4}, {3, 1}, {1, 3}})
+    for (const auto& shape : std::vector<std::pair<int, int>>{{grid.rows, grid.columns}, {4, 4}, {3, 1}, {1, 3}}) {
+        if (state.should_stop()) return;
         state.evaluate_candidate(build_tiled_plan(grid, single, cores, Configuration{0, shape.first, shape.second, 0, 1, grid.depth}));
+    }
     if (state.should_stop()) return;
     // 生成按行、列和二维矩形划分的候选。
     auto regions = generate_core_partitions(g, grid, cores);
 
-    struct Seed { Evaluation score; Configuration config; };
+    // 分块筛选只需要时间和搬运量，无需保存整份时间线。
+    struct Seed { Cost makespan, bytes; Configuration config; };
     std::vector<Seed> seeds;
     // 将参数展开为方案，评估后保存有效候选。
     const auto test = [&](Configuration config) {
+        if (state.should_stop()) return;
         const Plan plan = build_tiled_plan(grid, regions[config.partition], cores, config);
         const Evaluation score = state.evaluate_candidate(plan);
-        if (score.valid) seeds.push_back(Seed{score, config});
+        if (score.valid) seeds.push_back(Seed{score.makespan, score.bytes, config});
     };
     // 按 90% L1 估算能保留整段累加输入的细长块宽度。
     const auto resident_width = [&](Cost operand, Cost other, int dimension) {
@@ -345,7 +290,7 @@ void try_tiled_matmul_plans(const Graph& g, const MatmulGrid& grid, int cores, P
     if (state.should_stop() || seeds.empty()) return;
     // 按时间、搬运量排序，保留至多 4 种不同分核。
     std::stable_sort(seeds.begin(), seeds.end(), [](const Seed& a, const Seed& b) {
-        return std::tie(a.score.makespan, a.score.bytes) < std::tie(b.score.makespan, b.score.bytes);
+        return std::tie(a.makespan, a.bytes) < std::tie(b.makespan, b.bytes);
     });
     std::vector<Configuration> beam;
     std::set<int> selected;
@@ -358,6 +303,7 @@ void try_tiled_matmul_plans(const Graph& g, const MatmulGrid& grid, int cores, P
             config.group = group; config.step = step; config.walk = walk;
             test(config);
         }
+    if (state.should_stop()) return;
     // 容量粗估筛选更多块形状，最终优劣由完整性能模型决定。
     std::vector<std::pair<int, int>> shapes;
     for (int r = 1; r <= std::min(12, grid.rows); ++r)
@@ -379,7 +325,7 @@ void try_tiled_matmul_plans(const Graph& g, const MatmulGrid& grid, int cores, P
     if (state.should_stop()) return;
     // 从全部有效候选取前 4 名，再细调交错块数和累加步长。
     std::stable_sort(seeds.begin(), seeds.end(), [](const Seed& a, const Seed& b) {
-        return std::tie(a.score.makespan, a.score.bytes) < std::tie(b.score.makespan, b.score.bytes);
+        return std::tie(a.makespan, a.bytes) < std::tie(b.makespan, b.bytes);
     });
     std::vector<Configuration> best;
     for (std::size_t i = 0; i < std::min<std::size_t>(4, seeds.size()); ++i) best.push_back(seeds[i].config);
@@ -391,18 +337,20 @@ void try_tiled_matmul_plans(const Graph& g, const MatmulGrid& grid, int cores, P
 
 Plan solve_matmul(const Graph& graph, const MatmulGrid& grid, int cores) {
     // 1. 初始化搜索次数上限和最优结果记录。
-    PlanSearchState state(graph, cores);
+    const int budget = static_cast<int>(std::min<std::size_t>(640,
+        std::max<std::size_t>(12, 9000000 / std::max<std::size_t>(1, graph.work.size()))));
+    PlanSearchState state(graph, cores, budget, StopRule::TimeAndCopyBounds);
 
     // 2. 尝试不同分块、分核和核内执行顺序。
     try_tiled_matmul_plans(graph, grid, cores, state);
 
     // 3. 仍需搜索时，再尝试按计算量均衡分核。
     if (!state.should_stop()) {
-        try_load_balanced_plans(graph, cores, state);
+        try_load_balanced_plans(graph, grid, cores, state);
     }
 
     // 4. 返回所有已试方案中最好的一个。
-    return state.best_plan;
+    return state.best.plan;
 }
 
 } // 匿名命名空间
@@ -417,4 +365,4 @@ Plan solve(const Graph& graph, int cores) {
         return solve_general(graph, cores);
     }
 }
-} // namespace npu
+} // npu 命名空间

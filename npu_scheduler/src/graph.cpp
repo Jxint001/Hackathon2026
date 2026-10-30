@@ -14,9 +14,7 @@ namespace npu {
 namespace {
 using Json = nlohmann::json;
 
-// The DOM callback parser repeatedly scans growing arrays at object_end.
-// A linear SAX validation pass keeps duplicate-key rejection without that
-// quadratic overhead on large graph edge arrays.
+// 流式检查重复键，避免反复扫描大数组。
 struct KeyValidator : nlohmann::json_sax<Json> {
     std::vector<std::unordered_set<std::string>> keys;
     bool null() override { return true; }
@@ -261,7 +259,7 @@ void write_plan(const Graph& g, const Plan& plan, const std::filesystem::path& o
         std::error_code ec;
         std::filesystem::rename(temporary, output, ec);
         if (ec) {
-            // Windows does not replace an existing destination with rename.
+            // Windows 重命名不能直接覆盖已有文件。
             if (std::filesystem::is_regular_file(output)) std::filesystem::remove(output);
             std::filesystem::rename(temporary, output);
         }
@@ -271,4 +269,4 @@ void write_plan(const Graph& g, const Plan& plan, const std::filesystem::path& o
         throw;
     }
 }
-} // namespace npu
+} // npu 命名空间

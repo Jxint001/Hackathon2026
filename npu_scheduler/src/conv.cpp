@@ -1,5 +1,5 @@
 #include "conv.hpp"
-#include "model.hpp"
+#include "search.hpp"
 
 #include <cmath>
 #include <functional>
@@ -239,8 +239,7 @@ struct Regions {
         }
         // 推断位置，汇总各单元的依赖和流水线负载。
         const auto coordinates = locality_axis(g);
-        const auto original = compact ? dependency_order(g, true) : original_order(g);
-        for (int v : original) units[of[v]].ops.push_back(v);
+        for (int v : g.work) units[of[v]].ops.push_back(v);
         for (int v : g.work) {
             auto& unit = units[of[v]];
             unit.work[g.ops[v].pipe] += std::max<Cost>(1, g.ops[v].cycles);
@@ -270,31 +269,6 @@ struct Regions {
                 if (!--degree[u]) ready.push(u);
             }
         }
-        std::vector<int> priority(units.size(), INT32_MAX);
-        for (int i = 0; i < static_cast<int>(original.size()); ++i) priority[of[original[i]]] = std::min(priority[of[original[i]]], i);
-        using Entry = std::pair<int, int>;
-        std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> ordered;
-        for (int v : topo) { degree[v] = static_cast<int>(units[v].pred.size()); if (!degree[v]) ordered.emplace(priority[v], v); }
-        while (!ordered.empty()) {
-            const int v = ordered.top().second; ordered.pop(); dfs.push_back(v);
-            for (int u : units[v].succ) if (!--degree[u]) ordered.emplace(priority[u], u);
-        }
-        if (compact) {
-            dfs.clear();
-            std::vector<int> stack;
-            std::vector<char> visited(units.size());
-            const auto less = [&](int a, int b) { return units[a].depth != units[b].depth ? units[a].depth < units[b].depth : a > b; };
-            for (int v : topo) if (units[v].succ.empty()) stack.push_back(v);
-            std::sort(stack.begin(), stack.end(), less);
-            while (!stack.empty()) {
-                const int v = stack.back();
-                if (visited[v]) { stack.pop_back(); continue; }
-                std::vector<int> pending;
-                for (int p : units[v].pred) if (!visited[p]) pending.push_back(p);
-                if (pending.empty()) { visited[v] = 1; dfs.push_back(v); stack.pop_back(); }
-                else { std::sort(pending.begin(), pending.end(), less); stack.insert(stack.end(), pending.begin(), pending.end()); }
-            }
-        }
         // 前者仅有这个后继、后者仅有这个前驱时，串成迁移候选链。
         for (int v : topo) {
             if (units[v].pred.size() == 1 && units[units[v].pred[0]].succ.size() == 1) continue;
@@ -319,6 +293,42 @@ struct Regions {
             const auto e = g.direct[i];
             if (!g.ops[e.first].copy && !g.ops[e.second].copy)
                 add_net(Net{{of[e.first]}, {of[e.second]}, transfer_cycles(g.direct_bytes[i]), false});
+        }
+        prepare_order(use_compact);
+    }
+
+    // 两套搜索只切换参考顺序，复用分组、位置和搬运关系。
+    void prepare_order(bool use_compact) {
+        compact = use_compact;
+        const auto original = compact ? dependency_order(graph, true) : original_order(graph);
+        for (auto& unit : units) unit.ops.clear();
+        for (int v : original) units[of[v]].ops.push_back(v);
+        dfs.clear();
+        std::vector<int> degree(units.size());
+        std::vector<int> priority(units.size(), INT32_MAX);
+        for (int i = 0; i < static_cast<int>(original.size()); ++i) priority[of[original[i]]] = std::min(priority[of[original[i]]], i);
+        using Entry = std::pair<int, int>;
+        std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> ordered;
+        for (int v : topo) { degree[v] = static_cast<int>(units[v].pred.size()); if (!degree[v]) ordered.emplace(priority[v], v); }
+        while (!ordered.empty()) {
+            const int v = ordered.top().second; ordered.pop(); dfs.push_back(v);
+            for (int u : units[v].succ) if (!--degree[u]) ordered.emplace(priority[u], u);
+        }
+        if (compact) {
+            dfs.clear();
+            std::vector<int> stack;
+            std::vector<char> visited(units.size());
+            const auto less = [&](int a, int b) { return units[a].depth != units[b].depth ? units[a].depth < units[b].depth : a > b; };
+            for (int v : topo) if (units[v].succ.empty()) stack.push_back(v);
+            std::sort(stack.begin(), stack.end(), less);
+            while (!stack.empty()) {
+                const int v = stack.back();
+                if (visited[v]) { stack.pop_back(); continue; }
+                std::vector<int> pending;
+                for (int p : units[v].pred) if (!visited[p]) pending.push_back(p);
+                if (pending.empty()) { visited[v] = 1; dfs.push_back(v); stack.pop_back(); }
+                else { std::sort(pending.begin(), pending.end(), less); stack.insert(stack.end(), pending.begin(), pending.end()); }
+            }
         }
     }
 
@@ -540,50 +550,22 @@ Plan just_in_time(const Regions& r, const Plan& base, double factor, bool expand
     return result;
 }
 
-std::pair<std::uint64_t, std::uint64_t> fingerprint(const Plan& p) {
-    std::uint64_t a = 1469598103934665603ULL, b = 0x9e3779b97f4a7c15ULL;
-    for (const auto& order : p.orders) {
-        a = (a ^ UINT64_MAX) * 1099511628211ULL; b = b * 6364136223846793005ULL + order.size();
-        for (int v : order) { a = (a ^ static_cast<std::uint64_t>(v)) * 1099511628211ULL; b = (b ^ a) * 2862933555777941757ULL + 3037000493ULL; }
-    }
-    return {a, b};
-}
-
-// 一份完整方案及其预测结果。
-struct Candidate { Plan plan; Evaluation score; };
-bool better(const Candidate& a, const Candidate& b) {
-    return std::tie(a.score.makespan, a.score.bytes, a.plan.orders) < std::tie(b.score.makespan, b.score.bytes, b.plan.orders);
-}
-
-// 本轮搜索记录：次数、最优方案和待细化候选。
-struct Search {
+// 共用评估与预算，额外保留至多四种分核供局部搜索。
+struct GeneralSearch : PlanSearchState {
     const Regions& r;
-    int cores, attempts = 0, limit;
-    Candidate best;
     std::vector<Candidate> beam;
-    std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
-    Cost lower;
-    Search(const Regions& regions, int n) : r(regions), cores(n),
-        limit(static_cast<int>(std::min<std::size_t>(144, std::max<std::size_t>(20, 1800000 / std::max<std::size_t>(1, r.graph.work.size()))))),
-        lower(universal_lower_bound(r.graph, n)) {}
-    // 本轮评估次数用完，或最优时间达到下界时停止。
-    bool finished() const { return attempts >= limit || (best.score.valid && best.score.makespan == lower); }
-    // 去重、下界剪枝、完整评估，再更新最优结果。
-    bool consider(Plan p, const char* label) {
-        if (finished() || !seen.insert(fingerprint(p)).second) return false;
-        if (partition_lower_bound(r.graph, p) > best.score.makespan) return false;
-        ++attempts;
-        auto score = evaluate(r.graph, p, best.score.makespan);
-#ifdef NPU_SEARCH_TRACE
-        std::cerr << attempts << ' ' << label << " time=" << score.makespan << " bytes=" << score.bytes << " error=" << score.error << '\n';
-#else
-        (void)label;
-#endif
-        if (!score.valid) return false;
+
+    GeneralSearch(const Regions& regions, int n)
+        : PlanSearchState(regions.graph, n,
+              static_cast<int>(std::min<std::size_t>(144, std::max<std::size_t>(20,
+                  1800000 / std::max<std::size_t>(1, regions.graph.work.size())))), StopRule::TimeBound),
+          r(regions) {}
+
+    void consider(Plan p, const char* label) {
+        auto score = evaluate_candidate(p, label);
+        if (!score.valid) return;
         Candidate candidate{std::move(p), std::move(score)};
-        const bool improved = !best.score.valid || better(candidate, best);
-        if (improved) best = candidate;
-        // 每种分核保留最好的顺序，最多保留四种分核。
+        // 每种分核保留最好的顺序。
         const auto owner = r.owners(candidate.plan);
         bool present = false;
         for (auto& old : beam) if (r.owners(old.plan) == owner) {
@@ -593,9 +575,6 @@ struct Search {
         if (!present) beam.push_back(std::move(candidate));
         std::stable_sort(beam.begin(), beam.end(), better);
         if (beam.size() > 4) beam.resize(4);
-        if (best.score.valid && static_cast<double>(best.score.makespan - lower) <= 0.005 * best.score.makespan)
-            limit = std::min(limit, std::max(24, attempts + 8));
-        return improved;
     }
 };
 
@@ -624,9 +603,8 @@ std::vector<int> reference_order(const Regions& r, const Candidate& candidate) {
     return result.size() == r.units.size() ? result : r.dfs;
 }
 
-// 生成初始核归属，并为每种分核尝试不同执行顺序。
-void initial_placements(Search& search) {
-    const auto& r = search.r;
+// 只生成核归属，按粗估筛选后交给排序函数。
+std::vector<std::vector<int>> make_initial_placements(const Regions& r, int cores) {
     const int count = static_cast<int>(r.units.size());
     std::vector<std::vector<int>> assignments;
     // 无依赖连接的区域分别整组分核。
@@ -642,7 +620,7 @@ void initial_placements(Search& search) {
             ranked.emplace_back(-work, component.first);
         }
         std::sort(ranked.begin(), ranked.end());
-        std::vector<Cost> load(search.cores);
+        std::vector<Cost> load(cores);
         std::vector<int> owner(count);
         for (const auto& item : ranked) {
             const int c = static_cast<int>(std::min_element(load.begin(), load.end()) - load.begin());
@@ -661,7 +639,7 @@ void initial_placements(Search& search) {
     double maximum = 0;
     for (int v : sorted) maximum = std::max(maximum, r.units[v].coordinate);
     // 比较计算量均衡、位置等分及边界偏移的分核。
-    for (int q = search.cores; q >= 2; --q) {
+    for (int q = cores; q >= 2; --q) {
         for (int style = 0; style < (r.spatial ? 3 : 1); ++style) {
             std::vector<int> owner(count);
             Cost accumulated = 0;
@@ -689,7 +667,7 @@ void initial_placements(Search& search) {
                     const int cell = std::max(0, static_cast<int>(r.units[v].coordinate / step));
                     owner[v] = std::min(q - 1, static_cast<int>(std::upper_bound(ends.begin(), ends.end(), cell) - ends.begin()));
                     // 小而共享的根单元固定到核 0。
-                    if (r.units[v].pred.empty() && r.units[v].succ.size() >= static_cast<std::size_t>(4 * search.cores) &&
+                    if (r.units[v].pred.empty() && r.units[v].succ.size() >= static_cast<std::size_t>(4 * cores) &&
                         std::accumulate(r.units[v].work.begin(), r.units[v].work.end(), Cost{0}) <= kCrossCoreDelay / 8) owner[v] = 0;
                 }
                 assignments.push_back(std::move(owner));
@@ -702,7 +680,7 @@ void initial_placements(Search& search) {
         std::vector<Cost> weights(r.chains.size());
         for (int i : chain_ids) for (int v : r.chains[i]) weights[i] += std::accumulate(r.units[v].work.begin(), r.units[v].work.end(), Cost{0});
         std::stable_sort(chain_ids.begin(), chain_ids.end(), [&](int a, int b) { return weights[a] > weights[b]; });
-        std::vector<Cost> load(search.cores);
+        std::vector<Cost> load(cores);
         std::vector<int> owner(count);
         for (int i : chain_ids) {
             const int c = static_cast<int>(std::min_element(load.begin(), load.end()) - load.begin());
@@ -714,10 +692,46 @@ void initial_placements(Search& search) {
     // 去重并按负载、搬运粗估筛选，最多保留 12 种分核。
     std::sort(assignments.begin(), assignments.end());
     assignments.erase(std::unique(assignments.begin(), assignments.end()), assignments.end());
-    std::stable_sort(assignments.begin(), assignments.end(), [&](const auto& a, const auto& b) {
-        return Placement(r, a, search.cores).estimate() < Placement(r, b, search.cores).estimate();
+    // 每种分核只计算一次粗估费用。
+    struct Ranked { double estimate; std::vector<int> owner; };
+    std::vector<Ranked> ranked;
+    for (auto& owner : assignments) {
+        const double estimate = Placement(r, owner, cores).estimate();
+        ranked.push_back(Ranked{estimate, std::move(owner)});
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        return a.estimate < b.estimate;
     });
-    if (assignments.size() > 12) assignments.resize(12);
+    if (ranked.size() > 12) ranked.resize(12);
+    assignments.clear();
+    for (auto& item : ranked) assignments.push_back(std::move(item.owner));
+    return assignments;
+}
+
+// 保留现有两步延后顺序，先处理输出膨胀的组，再处理其中后继唯一的组。
+Plan delay_expanding_producers(const Regions& r, Plan p) {
+    p = just_in_time(r, p, 1, true, false);
+    return just_in_time(r, p, 1, true, true);
+}
+
+// 固定分核，比较参考顺序、就绪重排和延后生产者。
+void try_initial_orders(GeneralSearch& search, const std::vector<int>& owner, double bias) {
+    const auto& r = search.r;
+    if (search.should_stop()) return;
+    search.consider(r.project(owner, r.dfs, search.cores), "placement-dfs");
+    for (double preference : {0.0, bias}) {
+        if (search.should_stop()) return;
+        const auto order = reorder(r, owner, search.cores, r.dfs, 4096, preference, 0);
+        Plan p = r.project(owner, order, search.cores);
+        search.consider(p, "placement-list");
+        if (search.should_stop()) return;
+        search.consider(delay_expanding_producers(r, std::move(p)), "placement-jit");
+    }
+}
+
+void try_initial_plans(GeneralSearch& search) {
+    const auto& r = search.r;
+    const auto assignments = make_initial_placements(r, search.cores);
     std::vector<Cost> durations;
     for (const auto& unit : r.units) if (unit.work[2] > 1) durations.push_back(unit.work[2]);
     std::sort(durations.begin(), durations.end());
@@ -725,31 +739,22 @@ void initial_placements(Search& search) {
 #ifdef NPU_SEARCH_TRACE
     std::cerr << "seed axis=" << r.spatial << " step=" << band_step(r, search.cores) << " bias=" << bias << '\n';
 #endif
-    // 每种分核比较原顺序、就绪重排和生产者延后。
     for (const auto& owner : assignments) {
-        if (search.finished()) break;
-        search.consider(r.project(owner, r.dfs, search.cores), "placement-dfs");
-        for (double preference : {0.0, bias}) {
-            const auto order = reorder(r, owner, search.cores, r.dfs, 4096, preference, 0);
-            Plan p = r.project(owner, order, search.cores);
-            search.consider(p, "placement-list");
-            p = just_in_time(r, p, 1, true, false);
-            p = just_in_time(r, p, 1, true, true);
-            search.consider(std::move(p), "placement-jit");
-        }
+        if (search.should_stop()) break;
+        try_initial_orders(search, owner, bias);
     }
 }
 
 // 固定核归属，尝试缩短驻留和重排就绪单元。
-void improve_orders(Search& search, int budget) {
-    const int end = std::min(search.limit, search.attempts + budget);
+void improve_orders(GeneralSearch& search, int budget) {
+    const int end = std::min(search.max_evaluations, search.evaluated_count + budget);
     auto seeds = search.beam;
     if (seeds.size() > 3) seeds.resize(3);
     for (const auto& seed : seeds) {
         const auto owner = search.r.owners(seed.plan);
         const auto reference = reference_order(search.r, seed);
         for (double factor : {1.0, 0.5, 2.0}) {
-            if (search.attempts >= end || search.finished()) return;
+            if (search.evaluated_count >= end || search.should_stop()) return;
             auto p = just_in_time(search.r, seed.plan, factor, false, false);
             search.consider(std::move(p), "live-area");
         }
@@ -762,12 +767,12 @@ void improve_orders(Search& search, int budget) {
         std::sort(stages.begin(), stages.end());
         if (stages.size() > 3) stages.resize(3);
         for (const auto& stage : stages) {
-            if (search.attempts >= end || search.finished()) return;
+            if (search.evaluated_count >= end || search.should_stop()) return;
             auto p = just_in_time(search.r, seed.plan, 0.5, false, false, stage.second);
             search.consider(std::move(p), "spill-stage-jit");
         }
         for (int window : {64, 512}) {
-            if (search.attempts >= end || search.finished()) return;
+            if (search.evaluated_count >= end || search.should_stop()) return;
             const auto order = reorder(search.r, owner, search.cores, reference, window, 0, 4.0 * kCrossCoreDelay);
             auto p = search.r.project(owner, order, search.cores);
             p = just_in_time(search.r, p, 1, false, false);
@@ -894,9 +899,9 @@ std::vector<Move> propose_moves(const Regions& r, const Candidate& seed, int cor
 }
 
 // 联合修改核归属和执行顺序，最多进行三轮局部搜索。
-void refine_placements(Search& search) {
-    const int end = search.limit - (search.r.compact ? 0 : 12);
-    for (int round = 0; round < 3 && !search.finished() && search.attempts < end; ++round) {
+void refine_placements(GeneralSearch& search) {
+    const int end = search.max_evaluations - (search.r.compact ? 0 : 12);
+    for (int round = 0; round < 3 && !search.should_stop() && search.evaluated_count < end; ++round) {
         auto seeds = search.beam;
         if (seeds.size() > 2) seeds.resize(2);
         const auto previous = fingerprint(search.best.plan);
@@ -904,7 +909,7 @@ void refine_placements(Search& search) {
             const auto moves = propose_moves(search.r, seed, search.cores, search.best.score.makespan);
             const auto reference = reference_order(search.r, seed);
             for (const auto& move : moves) {
-                if (search.finished() || search.attempts >= end) return;
+                if (search.should_stop() || search.evaluated_count >= end) return;
                 auto owner = search.r.owners(seed.plan);
                 for (const auto& change : move.changes) owner[change.first] = change.second;
                 // 迁核后，先保留原有顺序并尝试延后生产者。
@@ -912,11 +917,10 @@ void refine_placements(Search& search) {
                 p = just_in_time(search.r, p, 1, false, false);
                 search.consider(std::move(p), "move-preserve");
                 // 再重排核内顺序，评估同一迁移的另一种执行方式。
-                if (search.finished() || search.attempts >= end) return;
+                if (search.should_stop() || search.evaluated_count >= end) return;
                 const auto order = reorder(search.r, owner, search.cores, reference, 512, 0, 0);
                 p = search.r.project(owner, order, search.cores);
-                p = just_in_time(search.r, p, 1, true, false);
-                p = just_in_time(search.r, p, 1, true, true);
+                p = delay_expanding_producers(search.r, std::move(p));
                 search.consider(std::move(p), "move-reorder");
             }
         }
@@ -928,7 +932,7 @@ void refine_placements(Search& search) {
 Candidate run_search(const Regions& regions, int cores) {
     const auto& graph = regions.graph;
     // 初始化本轮搜索记录。
-    Search search(regions, cores);
+    GeneralSearch search(regions, cores);
 
     // 1. 全部组放核 0，分别按依赖遍历序和拓扑序生成方案。
     std::vector<int> single(regions.units.size());
@@ -936,16 +940,16 @@ Candidate run_search(const Regions& regions, int cores) {
     search.consider(regions.project(single, regions.topo, cores), "single-topo");
 
     // 2. 生成并评估多核初始方案。
-    if (!search.finished()) initial_placements(search);
+    if (!search.should_stop()) try_initial_plans(search);
 
     // 3. 保持核归属，先改进执行顺序。
-    if (!search.finished()) improve_orders(search, 16);
+    if (!search.should_stop()) improve_orders(search, 16);
 
     // 4. 从较好方案出发，尝试迁核并配合重排。
-    if (!search.finished() && search.best.score.valid) refine_placements(search);
+    if (!search.should_stop() && search.best.score.valid) refine_placements(search);
 
     // 5. 对改进后的分核再优化一次顺序。
-    if (!search.finished()) improve_orders(search, 12);
+    if (!search.should_stop()) improve_orders(search, 12);
     if (!search.best.score.valid) {
         // 都失败时，尝试原图单核顺序，放开组内连续排列的限制。
         Plan fallback; fallback.orders.resize(cores);
@@ -960,15 +964,15 @@ Candidate run_search(const Regions& regions, int cores) {
 
 Plan solve_general(const Graph& graph, int cores) {
     // 第一套：选下一组时，每个就绪队列最多比较 12 组。
-    Regions compact(graph, true);
-    Candidate best = run_search(compact, cores);
+    Regions regions(graph, true);
+    Candidate best = run_search(regions, cores);
     // 时间已达到下界时提前结束。
     if (best.score.valid && best.score.makespan == universal_lower_bound(graph, cores)) return best.plan;
 
     // 第二套：每队列最多比较 64 组，另试粗分段和按层延后。
     // run_search 新建搜索记录，两套评估次数预算互相独立。
-    Regions broad(graph, false);
-    Candidate other = run_search(broad, cores);
+    regions.prepare_order(false);
+    Candidate other = run_search(regions, cores);
     // 两轮结果一起比较，返回较好的方案。
     return better(other, best) ? other.plan : best.plan;
 }

@@ -4,4 +4,4 @@
 
 namespace npu {
 Plan solve(const Graph& graph, int cores);
-} // namespace npu
+} // npu 命名空间

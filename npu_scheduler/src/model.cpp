@@ -117,7 +117,7 @@ std::vector<Task> build_tasks(const Graph& g, const Plan& plan, std::vector<Link
             const int op = plan.orders[c][i]; owner[op] = c; rank[op] = i;
         }
 
-    // Preserve original numeric ordering even when IDs occupy the end of uint64.
+    // 大 ID 按数值顺序重编号，避免新增节点时溢出。
     const bool remap = g.max_id > UINT64_MAX - 100000000ULL;
     std::vector<Id> ordered_ids;
     if (remap) {
@@ -269,8 +269,7 @@ void expand_spills(Task& task) {
                 if (current[t] != i && next_use[t] != INT32_MAX &&
                     (victim == -1 || next_use[t] > next_use[victim])) victim = t;
             if (victim == -1) {
-                // Current operands cannot be evicted. Their transient peak may
-                // exceed the soft threshold, but never the physical capacity.
+                // 当前操作的数据不换出，允许超过软阈值，但不能超过容量。
                 if (used[p] <= kCapacity[p]) break;
                 throw std::runtime_error("an operation exceeds on-chip capacity");
             }
@@ -293,7 +292,7 @@ void expand_spills(Task& task) {
         for (int t : op.inputs) if (task.buffers[t].storage == -1) { ddr = t; ++count; }
         if (count == 1) for (int t : op.outputs) if (task.buffers[t].storage >= 0) {
             if (backing[t] == -1) backing[t] = ddr;
-            else if (backing[t] != ddr) backing[t] = -2; // Conflicting COPY_IN backings.
+            else if (backing[t] != ddr) backing[t] = -2; // 搬入来源不唯一。
         }
     }
     for (int t = 0; t < nt; ++t) {
@@ -313,8 +312,7 @@ void expand_spills(Task& task) {
         const Id out_id = write_back ? next_id++ : 0;
         const Id in_id = next_id++;
         if (write_back) {
-            // Each dirty writeback gets a new DDR version; older reloads must
-            // keep depending on the data saved before the later writers.
+            // 每次写回新建 DDR 版本，保证先前读回仍使用旧数据。
             synced_step[logical] = sp.after;
             backing[logical] = static_cast<int>(task.buffers.size());
             task.buffers.push_back(Buffer{next_id++, -1, bytes, {}, {}});
@@ -362,8 +360,7 @@ void expand_spills(Task& task) {
         if (position[pred] >= position[op]) throw std::runtime_error("spill expansion violates dependency order");
 }
 
-// Reference-compatible integer-set visitation for operand retirement. This
-// affects the order of reusable memory credits, not the chosen task order.
+// 匹配评测器的整数集合顺序，用于回收内存额度。
 std::vector<int> operand_set_order(const Task& task, const std::vector<int>& values) {
     if (values.empty()) return {};
     if (values.size() == 1) return {values.front()};
@@ -655,7 +652,7 @@ Cost necessary_io(const Graph& g, const std::vector<int>* owner) {
     }
     return service;
 }
-} // namespace
+} // 匿名命名空间
 
 // 所有分核方案的执行时间下界，取以下三项的最大值。
 Cost universal_lower_bound(const Graph& g, int cores) {
@@ -667,7 +664,7 @@ Cost universal_lower_bound(const Graph& g, int cores) {
         work[g.ops[op].pipe] = checked_add(work[g.ops[op].pipe], time);
         bound = std::max(bound, time); // 至少覆盖最长单个操作的耗时。
     }
-    // 各 Pipe 的总计算量均分到所有核，耗时向上取整。
+    // 各流水线的总计算量均分到所有核，耗时向上取整。
     for (Cost w : work) bound = std::max(bound, w / cores + (w % cores != 0));
     return bound;
 }
@@ -730,4 +727,4 @@ Evaluation evaluate(const Graph& g, const Plan& plan, Cost incumbent) {
     }
     return result;
 }
-} // namespace npu
+} // npu 命名空间

@@ -9,6 +9,7 @@ add_executable(npu_sched
     src/main.cpp
     src/graph.cpp
     src/model.cpp
+    src/search.cpp
     src/conv.cpp
     src/strategy.cpp)
 target_include_directories(npu_sched PRIVATE third_party)
