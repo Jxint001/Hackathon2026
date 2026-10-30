@@ -9,8 +9,12 @@ add_executable(npu_sched
     src/main.cpp
     src/graph.cpp
     src/model.cpp
+    src/analysis.cpp
+    src/blocks.cpp
+    src/schedule.cpp
     src/search.cpp
-    src/conv.cpp
+    src/general.cpp
+    src/matmul.cpp
     src/strategy.cpp)
 target_include_directories(npu_sched PRIVATE third_party)
 set_target_properties(npu_sched PROPERTIES
@@ -24,5 +28,6 @@ if(MSVC)
     target_compile_options(npu_sched PRIVATE /W4 /permissive- /utf-8 /EHsc)
     target_compile_definitions(npu_sched PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 else()
-    target_compile_options(npu_sched PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(npu_sched PRIVATE -Wall -Wextra -Wpedantic -pthread)
+    target_link_options(npu_sched PRIVATE -pthread)
 endif()
