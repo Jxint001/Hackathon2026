@@ -1,104 +1,84 @@
-# 多核调度赛题最终评估代码
+# NPU 多核调度优化
 
-"华为杯"数学建模比赛A题评估代码
+Hackathon 题目二（场景 B）的 Conv/Matmul 多核调度方案，C++ 实现位于 `npu_scheduler/`。
 
-## 最常用的四条命令
+原数学建模题目见[《通用神经网络处理器下的多核调度问题》（PDF）](docs/通用神经网络处理器下的多核调度问题.pdf)。
 
-在项目根目录运行：
+项目展示海报见 [Poster（PDF）](docs/Poster.pdf)。
 
-```powershell
-python code/stub_multicore_cut_and_schedule.py <计算图.json> -n 4
-python code/multicore_cut_evaluate_problem_1.py <计算图.json> <方案.json> --config data/config.txt
-python code/multicore_cut_evaluate_problem_2.py <计算图.json> <方案.json> --config data/config.txt
-python code/multicore_cut_evaluate_problem_3.py <计算图.json> <方案.json> --config data/config.txt
+## 目录结构
+
+```text
+huawei/
+├── README.md                    # 项目说明、源码阅读顺序与构建运行
+├── npu_scheduler/               # C++17 方案生成程序
+│   ├── CMakeLists.txt           # Linux/Windows 构建配置
+│   ├── README.md                # 程序说明
+│   ├── include/                # 头文件：数据结构与函数声明
+│   │   ├── graph.hpp / plan.hpp / scheduler.hpp
+│   │   ├── initial_plan.hpp / plan_search.hpp / plan_evaluator.hpp
+│   │   ├── json_parser.hpp / thread_pool.hpp
+│   │   ├── search/             # 搜索组件声明
+│   │   └── evaluation/         # 内部模拟数据结构
+│   └── src/                    # .cpp 实现文件
+│       ├── main.cpp / scheduler.cpp
+│       ├── graph.cpp / plan.cpp / initial_plan.cpp
+│       ├── plan_search.cpp / plan_evaluator.cpp
+│       ├── search/             # 候选生成、阶段控制和搜索策略
+│       └── evaluation/         # 任务构造、调度与事件模拟
+├── code/                       # 官方评测工具
+├── data/                       # 官方计算图与评测配置
+├── docs/                       # 赛题、Poster、算法、评测与提交说明
+└── analysis_bounds/            # AI 辅助的加速比上界分析与构造例子
 ```
 
-省略 `<方案.json>` 时，脚本读取与计算图同目录的
-`<计算图文件名>_multicore_res.json`。每个评估器输出结果 JSON、简短日志和
-Perfetto Trace。`stub_multicore_cut_and_schedule.py` 只演示方案格式，不是
-基线算法。
+AI 辅助的加速比上界分析与高加速比构造见 [analysis_bounds](analysis_bounds/README.md)。
 
-## 从输入到 makespan 的完整流程
+## 建议阅读顺序
 
-1. **读取选手方案。** `derive_multicore_plan` 校验每个计算操作属于且只属于
-   一个子图，并检查每个子图只安排到一个核心；同一 tensor 的多个写者
-   （官方数据中的 WAW 累加）必须安排在**同一核心**，否则方案非法。
-   同时校验原图格式、唯一 ID、有效端点、非负 cycles/size，以及原始完整图
-   无环（包括 COPY 节点和同一子图内部的依赖）。`COPY_IN`/`COPY_OUT` 的
-   `cycles` 允许写 `-1`：其实际搬运周期由仿真器按搬运 tensor 大小与带宽
-   动态换算，该字段只作为缺少搬运 tensor 时的回退值。
-2. **形成 Task。** 问题 1 把每个子图作为一个 Task；问题 2、3 把同一核心
-   上的子图合并为一个 Task。跨 Task 或跨核心的数据边会生成 COPY。
-   由于方案保证同一 tensor 的写者同核，各核心本地只有一个写者集合，
-   跨核 COPY 不会与本地写入争用同一片上 buffer。
-3. **执行核内调度。** `schedule_step1` 生成拓扑访问顺序；
-   `schedule_step2` 在容量达到硬容量的 90%（固定阈值，给 Step3 乱序并行
-   预留余量）时提前插入换出和换入操作（多写者 tensor 换出时同时重命名
-   后续写者，并在数据被修改后重新写回 DDR）；`schedule_step3`
-   完成乱序排布并输出每条 Pipe 的确定顺序。
-4. **补偿地址依赖。** Step3 不求具体地址，而把 L1/UB 容量抽象成可拆分的
-   虚拟字节额度。额度再次用于新输出前，旧 tensor 的全部读者必须完成；
-   这些 WAR/WAW 关系作为直接 op→op 边写入执行图。额度可拆分和合并，
-   因而不产生地址碎片，也不需要在比赛中加入内存整理算法。
-5. **事件模拟。** 三个评估器直接装载 Step3 的执行图和逐 Pipe 顺序。
-   在启动事件循环前，问题1检查数据依赖与同核Task顺序的组合图；问题2/3
-   检查本地执行依赖、Pipe FIFO与跨核COPY组成的全局操作图，拒绝等待环。
-   模拟器完成已结束操作、推进 Pipe、释放新满足的真实数据依赖与内存复用
-   依赖、发射各 Pipe 的队首操作，然后跳到最近的下一事件时刻。
-6. **统计结果。** 最晚结束时刻是 makespan，同时输出每核时间线、片上内存
-   峰值、COPY 流量以及题三的 Cache 统计。
+以下阅读顺序均针对 `npu_scheduler/` 下的源码。先读 [src/scheduler.cpp](npu_scheduler/src/scheduler.cpp)，了解“初始分组 → 初始解 → 搜索”的总流程；再读 [include/plan.hpp](npu_scheduler/include/plan.hpp) 和 [include/graph.hpp](npu_scheduler/include/graph.hpp)，理解数据；随后读 [src/search/search_controller.cpp](npu_scheduler/src/search/search_controller.cpp) 的 `run()`、`phase()`、`consider()`。某个策略的细节按下表查找。
 
-## 选手入口与错误处理
+下表中的 `.cpp` 位于 `npu_scheduler/src/`，`.hpp` 位于 `npu_scheduler/include/`，子目录名称保持一致。
 
-选手调用三个问题评估器、`singlecore_evaluate.py` 或方案示例生成器。
-非法输入会返回非零退出码并在stderr输出 `[EVALUATION ERROR]`，不生成
-新的成功结果/Trace。若方案存在全局等待环，会在模拟开始前报告
-`dependency cycle` 及带类型的环边；Python异常的 `cycle` 属性保留完整环。
+| 文件 | 职责 |
+| --- | --- |
+| `main.cpp` | 参数解析、输入读取、方案写出和退出码 |
+| `graph.hpp/.cpp` | 输入图、依赖关系、共享写者与短链初始分组 |
+| `plan.hpp/.cpp` | 方案、成绩、统计，以及提交 JSON 序列化 |
+| `scheduler.cpp` | 串接初始化与后续搜索 |
+| `initial_plan.cpp` | 枚举核心数、遍历顺序和分核偏好，快速筛选后完整复核 |
+| `plan_search.cpp` | 完整搜索的外部入口 |
+| `search/search_controller.*` | 阶段安排、候选接受、缓存复用、最终方案返回 |
+| `search/search_state.hpp` | 一个搜索起点的最优解、计数、缓存和起点池 |
+| `search/candidate_generator.*` | 结构摘要、分核投影、资源下界、生产者延后、消费者前移、就绪排序 |
+| `search/candidate_evaluator.*` | 候选哈希、评估映射构造、完整方案构造 |
+| `search/structure_analysis.cpp` | 从张量共享关系推断空间位置 |
+| `search/grid_search.cpp` | 网格分核、子图粒度、对齐条带、容量分块 |
+| `search/spatial_search.cpp` | 空间分区与多管道重叠候选 |
+| `search/order_search.cpp` | 枚举核内顺序调整，提交给统一评估入口 |
+| `search/chain_search.cpp` | 整链、半链与双目标迁移 |
+| `search/multistart_search.cpp` | 空间和矩阵起点选择、独立搜索及结果合并 |
+| `plan_evaluator.cpp` | 内部性能模型的四步入口 |
+| `evaluation/task_builder.cpp` | 合并同核任务、构造输入输出和跨核搬运 |
+| `evaluation/local_schedule.cpp` | 按依赖和子图顺序生成核内指令顺序 |
+| `evaluation/memory_schedule.cpp` | 换出换入、容量释放和再分配依赖 |
+| `evaluation/global_simulation.cpp` | 模拟管道执行、跨核等待与共享 DDR |
+| `evaluation/model.hpp` | 任务、缓冲区、内存状态、事件状态；仅供模型内部使用 |
+| `json_parser.hpp` / `thread_pool.hpp` | 自实现 JSON 解析器 / 固定线程池 |
 
-原图必须包含 `ops`、`tensors`、`edges` 三个列表；op/tensor ID为非负整数，
-共享ID空间且唯一，边端点必须存在，禁止重复边和tensor→tensor直接边。
-每个 op 必须带 `pipe` 字段，且取值属于五条 Pipe 之一（`PIPE_MTE2`、
-`PIPE_MTE3`、`PIPE_M`、`PIPE_V`、`PIPE_FIX`）；仿真与调度都直接读
-该字段，不按 op 名称猜测 Pipe。op 名称本身不做白名单校验。
-方案中同一 tensor 的多个写者必须位于同一核心，违反时报
-`has writers on multiple cores`；`stub_multicore_cut_and_schedule.py`
-生成的示例方案已按该约束把共享写者的子图绑定到同一核心。
-配置项拼写错误、重复键、未知段、无效数值以及重复JSON键都会明确报错，
-不静默回退；显式 `--config` 指向不存在的文件也报错。
+## 构建与运行
 
-## 配置来源
+采用 C++17，没有第三方库，无需联网。Linux 使用系统线程库。
 
-评估用到的全部参数来自 `config.txt`，代码中不设默认值；配置缺失时脚本直接
-报错退出，不会用固定数值算出成绩。
+在仓库根目录运行，Linux（GCC 9.4+，CMake 3.16+）：
 
-|配置段|键|含义|是否必需|
-|---|---|---|---|
-|`[capacity]`|`L1` `UB`|片上 L1/UB 容量（字节）|必需|
-|`[bandwidth]`|`bandwidth`|DDR↔片上搬运带宽（字节/周期）|必需|
-|`[multicore_scene_a]`|`task_cross_core_wait_cycles` `task_same_core_wait_cycles`|题目 1 的 Task 等待|题目 1 必需|
-|`[multicore_scene_b]`|`cross_core_copy_delay_cycles`|题目 2/3 的跨核 COPY 等待|题目 2/3 必需|
-|`[problem_3]`|`cache_capacity_bytes` `cache_bandwidth_bytes_per_cycle`|题目 3 的 Cache 容量与命中带宽|题目 3 必需|
+```bash
+cmake -S npu_scheduler -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/bin/npu_sched "data/case_00.json" -n 4 -o "out/plan.json"
+```
 
-未指定 `--config` 时按"计算图所在目录/config.txt"查找，找不到就报
-`configuration file not found`。段名只接受上表中的五个，出现未知段（例如
-拼写错误，或已不再支持的 `[pipe_capacity]`）会报 `unknown section`，不会被
-静默忽略。
 
-`schedule_step1/2/3` 是内部算法接口，前序保证的DAG、拓扑序、ID唯一性和
-参数约束写在函数入口注释中，不再次校验。只有重排或跨核组合引入的新约束
-才需要新的检查；Step3保留自身新生成内存依赖的输出契约检查。
+核心数默认 4；未指定输出时写到输入同目录的 `<case>_multicore_res.json`。支持长选项 `--cores`、`--output` 以及 `--option=value`。退出码：0 成功、1 内部错误、2 参数错误、3 输入错误、4 写出错误、5 无合法方案。每进程最多 10 个线程。
 
-## 文件列表
-
-|文件|作用|建议阅读对象|
-|---|---|---|
-|`contest_io.py`|统一命令行、JSON、日志和 Trace|想了解输入输出的同学|
-|`evaluation_validation.py`|选手输入及全局执行依赖校验|理解不可执行方案的诊断|
-|`multicore_cut_evaluate_problem_1.py`|问题 1：每子图一个 Task|解答问题 1|
-|`multicore_cut_evaluate_problem_2.py`|问题 2：每核心一个 Task|解答问题 2|
-|`multicore_cut_evaluate_problem_3.py`|问题 3：增加只读 FIFO Cache|解答问题 3|
-|`schedule_step1.py`|无环图的核内访问顺序|理解拓扑调度|
-|`schedule_step2.py`|片上容量与 Spill 插入|理解内存约束|
-|`schedule_step3.py`|乱序排布、逐 Pipe 顺序和内存复用补边|理解执行依赖|
-|`stub_multicore_cut_and_schedule.py`|方案格式校验及随机示例|第一次运行代码|
-|`singlecore_evaluate.py`|单核基线|计算加速比|
+比赛提交与验收规范见[提交要求文档](docs/提交要求文档.md)。

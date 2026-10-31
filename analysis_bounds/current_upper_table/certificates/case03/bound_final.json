@@ -1,0 +1,42 @@
+{
+  "baseline_cycles": 6295267,
+  "q": 180,
+  "alpha": "277/720",
+  "beta": "1067/40",
+  "min_short_h": "0",
+  "certified_time_lower_bound": 1470191,
+  "certified_speedup_upper_bound": 4.281938197145813,
+  "conditional_certificate_at_threshold": {
+    "impossible_by_compute": false,
+    "time": 1470191,
+    "core_op_limit": 1435,
+    "raw_io_num": 7751560,
+    "raw_io_den": 2880,
+    "io_units_ceil": 2692,
+    "io_bytes_lower_bound": 88211456,
+    "worst_long_core_count": 5,
+    "worst_short_core_lengths": [],
+    "worst_long_core_op_total": 6144
+  },
+  "next_trial": {
+    "impossible_by_compute": false,
+    "time": 1470191,
+    "core_op_limit": 1435,
+    "raw_io_num": 7751560,
+    "raw_io_den": 2880,
+    "io_units_ceil": 2692,
+    "io_bytes_lower_bound": 88211456,
+    "worst_long_core_count": 5,
+    "worst_short_core_lengths": [],
+    "worst_long_core_op_total": 6144
+  },
+  "status": "PASS",
+  "graph_sha256": "2d098e3c81144b9e94e6cd2c8e97325c941112ec50148abd9e6e607bf381fb86",
+  "config_sha256": "0ebdd000063a14ab81e8f26e07fe5d82baddba865df7e5e64482ba12137df1e7",
+  "independent_oracle_audit": "PASS all 181 g values, direct predecessor enumeration\ngq 1764",
+  "io_units_lower_bound_exact": "193789/72",
+  "io_units_ceil": 2692,
+  "io_bytes_lower_bound_when_all_cores_long": 88211456,
+  "short_or_idle_core_time_lower_bound": 1527808,
+  "scope": "All legal five-core plans, arbitrary cross-core chain cuts and subgraph orders"
+}

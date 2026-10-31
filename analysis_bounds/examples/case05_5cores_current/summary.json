@@ -1,0 +1,65 @@
+{
+  "case": "case_05",
+  "num_cores": 5,
+  "active_cores": 5,
+  "baseline_cycles": 18876779,
+  "five_core_cycles": 5019326,
+  "speedup": 3.760819480543802,
+  "data_movement_bytes": {
+    "original_graph_copy_bytes": 81788928,
+    "scheduled_copy_bytes": 299892736,
+    "added_copy_bytes": 218103808,
+    "partition_added_copy_bytes": 78643200,
+    "spill_added_copy_bytes": 139460608
+  },
+  "cross_task_traffic": 0,
+  "memory_peak_by_core": {
+    "0": {
+      "L1": 1441792,
+      "UB": 0
+    },
+    "1": {
+      "L1": 1441792,
+      "UB": 0
+    },
+    "2": {
+      "L1": 1441792,
+      "UB": 0
+    },
+    "3": {
+      "L1": 1441792,
+      "UB": 0
+    },
+    "4": {
+      "L1": 1441792,
+      "UB": 0
+    }
+  },
+  "settings": {
+    "L1_bytes": 1572864,
+    "UB_bytes": 131072,
+    "bandwidth_bytes_per_cycle": 60,
+    "cross_core_copy_delay_cycles": 1000
+  },
+  "evaluator": "code/multicore_cut_evaluate_problem_2.py",
+  "graph": "data/case_05.json",
+  "config": "data/config.txt",
+  "plan_sha256": "8b176531f3f479dcf449f5111cd939599fc97e0b2eca55c98d060f60b9a23bf3",
+  "source_sha256": {
+    "code/schedule_step1.py": "d8fe721ff3dbe036e34a20c00cce6430960860000a49eb467e63465f76b84034",
+    "code/evaluation_validation.py": "99ef09a446b2d9752a83584629c5a158118ae3d7026bbb4723a648d5bc74126f",
+    "code/schedule_step2.py": "b80256b9b9e1a2d3ec2a42cf4938123da76ed959bab24fc8dadb8aac32f457d1",
+    "code/contest_io.py": "3deb2d3179f7b02063edc55beb236f525fa8fed5884ce1ca5b1fe89156c63a52",
+    "code/stub_multicore_cut_and_schedule.py": "9ae9ae4e8875e348e4e2e8f97b78e709bf88e6d0cbcc0bcd888707d34dfcd3ae",
+    "code/multicore_cut_evaluate_problem_2.py": "0b39f84d5ec0a7fba9a4c92a598a9044b97ab79c71393824c1ba130ecfe6c464",
+    "code/multicore_cut_evaluate_problem_3.py": "eab1504dead881f4b67c0f0498cbc2dbbd9039dc3c9d198c6af58773c127eeb0",
+    "code/singlecore_evaluate.py": "446b753ee134ef1fec8e052356bb077a2602fbe95572ccd3dddd7928e894b77a",
+    "code/multicore_cut_evaluate_problem_1.py": "2095f188a6c24ce3899f156bef21d50dcd87cbd9368488046b1e77e2bf91af3f",
+    "code/schedule_step3.py": "424fea21c6cec1c170fe5b0e4e08c5bb48f24ccb08b5fb38a836a2cb528d7466",
+    "data/case_05.json": "b808c1815aef9679fc9af7c70bdb21f41732aef88479defa411e4a49e231f515",
+    "data/config.txt": "0ebdd000063a14ab81e8f26e07fe5d82baddba865df7e5e64482ba12137df1e7"
+  },
+  "original_evaluation_sha256": "da860c751346262053447296db3728920f37aa974a8694787a21a2677a2a9979",
+  "result_kind": "previously evaluated construction; not a new evaluation or the general C++ solver score",
+  "evaluation_recorded_at": "2026-10-30 14:39:29 UTC"
+}

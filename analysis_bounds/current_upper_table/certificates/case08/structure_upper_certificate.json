@@ -1,0 +1,27 @@
+{
+  "baseline_cycles": 15419076,
+  "time_lower_bound": 2419734,
+  "speedup_upper_bound": 6.372219425771593,
+  "witness": {
+    "lower_bound": 2419734,
+    "release_threshold": 8281,
+    "tail_threshold": 581,
+    "capacity": 5,
+    "work": 12054360,
+    "node_count": 6384,
+    "example_nodes": [
+      "op:7914",
+      "op:7915",
+      "op:7916",
+      "op:7920",
+      "op:7921",
+      "op:7925",
+      "op:7926",
+      "op:7932"
+    ]
+  },
+  "graph_sha256": "9023008116cda6952e4632517903cc7954e3401e7465acdb7effb530cfec2f45",
+  "supports_excluding_4p8": false,
+  "method": "mandatory-transfer DAG critical release/tail plus PIPE_M workload window",
+  "memory_constraints_used": false
+}

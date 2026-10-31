@@ -1,272 +1,428 @@
+// 解析并校验计算图，收缩 COPY 依赖，绑定共享写者并建立无环分组。
 #include "graph.hpp"
-
-#include <nlohmann/json.hpp>
-
-#include <fstream>
-#include <limits>
+#include "json_parser.hpp"
+#include <algorithm>
+#include <numeric>
 #include <queue>
-#include <set>
-#include <stdexcept>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace npu {
 namespace {
-using Json = nlohmann::json;
-
-// 流式检查重复键，避免反复扫描大数组。
-struct KeyValidator : nlohmann::json_sax<Json> {
-    std::vector<std::unordered_set<std::string>> keys;
-    bool null() override { return true; }
-    bool boolean(bool) override { return true; }
-    bool number_integer(number_integer_t) override { return true; }
-    bool number_unsigned(number_unsigned_t) override { return true; }
-    bool number_float(number_float_t, const string_t&) override { return true; }
-    bool string(string_t&) override { return true; }
-    bool binary(binary_t&) override { return true; }
-    bool start_object(std::size_t) override { keys.emplace_back(); return true; }
-    bool end_object() override { keys.pop_back(); return true; }
-    bool key(string_t& name) override {
-        if (!keys.back().insert(name).second) throw std::invalid_argument("duplicate JSON object key");
-        return true;
+// 排序并去除容器中的重复值。
+template <class T> void unique(std::vector<T> &x) {
+    std::sort(x.begin(), x.end());
+    x.erase(std::unique(x.begin(), x.end()), x.end());
+}
+// 初始分组阶段的并查集，用于共享写者绑定、强连通分量合并和短链收缩。
+struct DSU {
+    std::vector<int> p, size;
+    // 初始化并查集，每个节点独立成组。
+    explicit DSU(int n) : p(n), size(n, 1) {
+        std::iota(p.begin(), p.end(), 0);
     }
-    bool start_array(std::size_t) override { return true; }
-    bool end_array() override { return true; }
-    bool parse_error(std::size_t, const std::string&, const nlohmann::detail::exception& error) override {
-        throw std::invalid_argument(error.what());
+    // 查找节点所在集合并压缩路径。
+    int find(int x) {
+        while (p[x] != x) {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        return x;
+    }
+    // 按组大小合并集合，平局时使用索引确定顺序。
+    void join(int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a == b) {
+            return;
+        }
+        if (size[a] < size[b] || (size[a] == size[b] && a > b)) {
+            std::swap(a, b);
+        }
+        p[b] = a;
+        size[a] += size[b];
     }
 };
-
-Id read_id(const Json& value) {
-    if (!value.is_number_integer() ||
-        (!value.is_number_unsigned() && value.get<std::int64_t>() < 0))
-        throw std::invalid_argument("node IDs must be nonnegative integers");
-    return value.get<Id>();
+// 读取 JSON 非负整数。
+Id nonnegative(const Json &v) {
+    Id n = v.integer();
+    if (n < 0) {
+        throw InputError("expected nonnegative integer");
+    }
+    return n;
 }
-
-Cost read_cost(const Json& value, bool placeholder = false) {
-    if (!value.is_number_integer()) throw std::invalid_argument("expected an integer size or cycle count");
-    if (value.is_number_unsigned() && value.get<Id>() > static_cast<Id>(kInfinity))
-        throw std::invalid_argument("size or cycle count exceeds the supported integer range");
-    const Cost result = value.get<Cost>();
-    if (result < 0 && !(placeholder && result == -1))
-        throw std::invalid_argument("negative size or compute cycle count");
-    if (result > kInfinity) throw std::invalid_argument("cycle count too large");
-    return result;
+// 使用小索引优先的拓扑排序检测有向环。
+std::vector<int> topological(const std::vector<std::vector<int>> &adj) {
+    std::vector<int> deg(adj.size()), order;
+    for (const auto &vs : adj) {
+        for (int v : vs) {
+            ++deg[v];
+        }
+    }
+    std::priority_queue<int, std::vector<int>, std::greater<int>> q;
+    for (int i = 0; i < static_cast<int>(adj.size()); ++i) {
+        if (!deg[i]) {
+            q.push(i);
+        }
+    }
+    while (!q.empty()) {
+        int u = q.top();
+        q.pop();
+        order.push_back(u);
+        for (int v : adj[u]) {
+            if (!--deg[v]) {
+                q.push(v);
+            }
+        }
+    }
+    if (order.size() != adj.size()) {
+        throw InputError("input graph contains a cycle");
+    }
+    return order;
 }
-
-void check_dag(const std::vector<std::vector<int>>& successors) {
-    std::vector<int> degree(successors.size(), 0);
-    for (const auto& list : successors) for (int v : list) ++degree[v];
-    std::vector<int> queue;
-    queue.reserve(successors.size());
-    for (std::size_t i = 0; i < degree.size(); ++i)
-        if (!degree[i]) queue.push_back(static_cast<int>(i));
-    for (std::size_t i = 0; i < queue.size(); ++i)
-        for (int v : successors[queue[i]]) if (--degree[v] == 0) queue.push_back(v);
-    if (queue.size() != successors.size()) throw std::invalid_argument("graph contains a dependency cycle");
 }
-}
-
-Graph read_graph(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot open " + path.u8string());
-    KeyValidator validator;
-    if (!Json::sax_parse(input, &validator)) throw std::invalid_argument("invalid graph JSON");
-    input.clear(); input.seekg(0);
-    const Json root = Json::parse(input);
-    if (!root.is_object()) throw std::invalid_argument("graph must be a JSON object");
-    for (const char* field : {"tensors", "ops", "edges"})
-        if (!root.contains(field) || !root.at(field).is_array())
-            throw std::invalid_argument(std::string("missing array: ") + field);
-
-    Graph g;
-    for (const auto& entry : root.at("tensors")) {
+// 解析官方图格式，建立计算操作依赖并检查单操作容量。
+Problem read_graph(const Json &root) {
+    Problem g;
+    std::unordered_map<Id, int> oi, ti;
+    for (const auto &x : root.at("ops").items()) {
+        Op o;
+        o.id = nonnegative(x.at("id"));
+        auto name = x.at("op").string();
+        o.copy = name == "COPY_IN" ? 1 : (name == "COPY_OUT" ? 2 : 0);
+        const auto &pipe = x.at("pipe").string();
+        const std::array<std::string, NUM_PIPES> names = {"PIPE_M", "PIPE_V", "PIPE_MTE2", "PIPE_MTE3",
+                                                          "PIPE_FIX"};
+        auto it = std::find(names.begin(), names.end(), pipe);
+        if (it == names.end()) {
+            throw InputError("unsupported pipe: " + pipe);
+        }
+        o.pipe = static_cast<int>(it - names.begin());
+        auto cycles = x.at("cycles").integer();
+        if (!o.copy && cycles < 0) {
+            throw InputError("negative compute cycles");
+        }
+        o.cycles = static_cast<double>(std::max<Id>(1, cycles));
+        g.ops.push_back(std::move(o));
+    }
+    // 比较操作 id，固定内部操作索引顺序。
+    std::sort(g.ops.begin(), g.ops.end(), [](const Op &a, const Op &b) { return a.id < b.id; });
+    for (int i = 0; i < static_cast<int>(g.ops.size()); ++i) {
+        if (!oi.emplace(g.ops[i].id, i).second) {
+            throw InputError("duplicate op id");
+        }
+    }
+    for (const auto &x : root.at("tensors").items()) {
         Tensor t;
-        t.id = read_id(entry.at("id"));
-        const auto position = entry.at("pos").get<std::string>();
-        if (position == "DDR") t.storage = -1;
-        else if (position == "L1") t.storage = 0;
-        else if (position == "UB") t.storage = 1;
-        else throw std::invalid_argument("unknown tensor position: " + position);
-        t.bytes = read_cost(entry.at("size"));
-        g.max_id = std::max(g.max_id, t.id);
+        t.id = nonnegative(x.at("id"));
+        t.size = nonnegative(x.at("size"));
+        auto pos = x.at("pos").string();
+        if (pos == "DDR") {
+            t.memory = 0;
+        } else if (pos == "L1") {
+            t.memory = 1;
+        } else if (pos == "UB") {
+            t.memory = 2;
+        } else {
+            throw InputError("unsupported tensor memory");
+        }
+        if (oi.count(t.id)) {
+            throw InputError("duplicate node id");
+        }
         g.tensors.push_back(std::move(t));
     }
-    for (const auto& entry : root.at("ops")) {
-        Operation op;
-        op.id = read_id(entry.at("id"));
-        op.name = entry.at("op").get<std::string>();
-        op.copy = op.name == "COPY_IN" ? 1 : op.name == "COPY_OUT" ? 2 : 0;
-        const auto pipe = entry.at("pipe").get<std::string>();
-        if (pipe == "PIPE_MTE2") op.pipe = 0;
-        else if (pipe == "PIPE_MTE3") op.pipe = 1;
-        else if (pipe == "PIPE_M") op.pipe = 2;
-        else if (pipe == "PIPE_V") op.pipe = 3;
-        else if (pipe == "PIPE_FIX") op.pipe = 4;
-        else throw std::invalid_argument("unsupported pipe: " + pipe);
-        op.cycles = read_cost(entry.at("cycles"), op.copy != 0);
-        g.max_id = std::max(g.max_id, op.id);
-        g.ops.push_back(std::move(op));
+    // 比较张量 id，固定内部张量索引顺序。
+    std::sort(g.tensors.begin(), g.tensors.end(),
+              [](const Tensor &a, const Tensor &b) { return a.id < b.id; });
+    for (int i = 0; i < static_cast<int>(g.tensors.size()); ++i) {
+        if (!ti.emplace(g.tensors[i].id, i).second) {
+            throw InputError("duplicate tensor id");
+        }
     }
-    std::sort(g.tensors.begin(), g.tensors.end(), [](const Tensor& a, const Tensor& b) { return a.id < b.id; });
-    std::sort(g.ops.begin(), g.ops.end(), [](const Operation& a, const Operation& b) { return a.id < b.id; });
-    if (g.ops.size() + g.tensors.size() > static_cast<std::size_t>(INT32_MAX))
-        throw std::invalid_argument("too many nodes");
-    struct Node { bool op; int index; };
-    std::unordered_map<Id, Node> ids;
-    ids.reserve(g.ops.size() + g.tensors.size());
-    for (int i = 0; i < static_cast<int>(g.ops.size()); ++i) {
-        if (!ids.emplace(g.ops[i].id, Node{true, i}).second)
-            throw std::invalid_argument("duplicate node ID");
-        if (!g.ops[i].copy) g.work.push_back(i);
+    std::vector<std::vector<int>> adj(g.ops.size());
+    for (const auto &x : root.at("edges").items()) {
+        Id a = nonnegative(x.at("source")), b = nonnegative(x.at("target"));
+        auto ao = oi.find(a), bo = oi.find(b);
+        auto at = ti.find(a), bt = ti.find(b);
+        if (ao != oi.end() && bt != ti.end()) {
+            g.ops[ao->second].outputs.push_back(bt->second);
+            g.tensors[bt->second].producers.push_back(ao->second);
+        } else if (at != ti.end() && bo != oi.end()) {
+            g.ops[bo->second].inputs.push_back(at->second);
+            g.tensors[at->second].consumers.push_back(bo->second);
+        } else {
+            throw InputError("expected tensor-op edge with existing endpoints");
+        }
     }
-    for (int i = 0; i < static_cast<int>(g.tensors.size()); ++i)
-        if (!ids.emplace(g.tensors[i].id, Node{false, i}).second)
-            throw std::invalid_argument("duplicate node ID");
+    for (auto &t : g.tensors) {
+        unique(t.producers);
+        unique(t.consumers);
+        for (int u : t.producers) {
+            for (int v : t.consumers) {
+                adj[u].push_back(v);
+            }
+        }
+        for (int u : t.consumers) {
+            if (g.ops[u].copy == 2) {
+                t.output = true;
+            }
+        }
+    }
+    for (auto &vs : adj) {
+        unique(vs);
+    }
+    auto order = topological(adj);
+    for (int u : order) {
+        if (!g.ops[u].copy) {
+            g.op_topo.push_back(u);
+        }
+    }
+    std::vector<std::vector<int>> pred(g.ops.size()), front(g.ops.size());
+    for (int u : order) {
+        for (int v : adj[u]) {
+            pred[v].push_back(u);
+        }
+    }
+    for (int u : order) {
+        std::vector<int> ps;
+        for (int p : pred[u]) {
+            ps.insert(ps.end(), front[p].begin(), front[p].end());
+        }
+        unique(ps);
+        if (g.ops[u].copy) {
+            front[u] = std::move(ps);
+        } else {
+            g.ops[u].preds = ps;
+            for (int p : ps) {
+                g.ops[p].succs.push_back(u);
+            }
+            front[u] = {u};
+        }
+    }
+    for (auto &o : g.ops) {
+        unique(o.inputs);
+        unique(o.outputs);
+    }
+    for (auto &t : g.tensors) {
+        // 识别需要从计算读写者列表中剔除的 COPY 操作。
+        auto copy = [&](int o) { return g.ops[o].copy != 0; };
+        t.producers.erase(std::remove_if(t.producers.begin(), t.producers.end(), copy), t.producers.end());
+        t.consumers.erase(std::remove_if(t.consumers.begin(), t.consumers.end(), copy), t.consumers.end());
+        if (!t.producers.empty() && t.consumers.empty()) {
+            t.output = true;
+        }
+    }
 
-    std::set<std::pair<Id, Id>> seen_edges;
-    for (const auto& entry : root.at("edges")) {
-        const Id src = read_id(entry.at("source")), dst = read_id(entry.at("target"));
-        if (!seen_edges.emplace(src, dst).second) throw std::invalid_argument("duplicate edge");
-        const auto a = ids.find(src), b = ids.find(dst);
-        if (a == ids.end() || b == ids.end()) throw std::invalid_argument("edge endpoint does not exist");
-        const auto x = a->second, y = b->second;
-        if (x.op && y.op) {
-            g.direct.emplace_back(x.index, y.index);
-            g.direct_bytes.push_back(entry.contains("data_size") ? read_cost(entry.at("data_size")) : 0);
+    for (const auto &o : g.ops) {
+        if (!o.copy) {
+            auto ts = o.inputs;
+            ts.insert(ts.end(), o.outputs.begin(), o.outputs.end());
+            unique(ts);
+            std::array<long double, 3> bytes{};
+            for (int t : ts) {
+                bytes[g.tensors[t].memory == 1 ? 1 : 2] += g.tensors[t].size;
+            }
+            if (bytes[1] > L1_CAPACITY || bytes[2] > UB_CAPACITY) {
+                throw NoPlan("operation working set exceeds fixed local capacity");
+            }
         }
-        else if (x.op) {
-            g.ops[x.index].outputs.push_back(y.index);
-            g.tensors[y.index].producers.push_back(x.index);
-        } else if (y.op) {
-            g.ops[y.index].inputs.push_back(x.index);
-            g.tensors[x.index].consumers.push_back(y.index);
-        } else throw std::invalid_argument("tensor-to-tensor edges are not supported");
     }
-    std::vector<std::vector<int>> full(g.ops.size());
-    g.pred.resize(g.ops.size());
-    g.succ.resize(g.ops.size());
-    const auto add = [&g, &full](int a, int b) {
-        full[a].push_back(b);
-        if (!g.ops[a].copy && !g.ops[b].copy) {
-            g.succ[a].push_back(b);
-            g.pred[b].push_back(a);
-        }
-    };
-    for (auto& t : g.tensors) {
-        unique_sort(t.producers); unique_sort(t.consumers);
-        for (int a : t.producers) for (int b : t.consumers) add(a, b);
-    }
-    for (const auto& edge : g.direct) add(edge.first, edge.second);
-    for (auto& op : g.ops) { unique_sort(op.inputs); unique_sort(op.outputs); }
-    for (auto& list : full) unique_sort(list);
-    for (auto& list : g.pred) unique_sort(list);
-    for (auto& list : g.succ) unique_sort(list);
-    check_dag(full);
-    g.topo = dependency_order(g, false);
     return g;
 }
 
-std::vector<int> dependency_order(const Graph& g, bool depth_first) {
-    std::vector<int> depth(g.ops.size()), degree(g.ops.size());
-    std::priority_queue<int, std::vector<int>, std::greater<int>> ready;
-    for (int op : g.work) {
-        degree[op] = static_cast<int>(g.pred[op].size());
-        if (!degree[op]) ready.push(op);
-    }
-    std::vector<int> result;
-    while (!ready.empty()) {
-        const int op = ready.top(); ready.pop(); result.push_back(op);
-        for (int v : g.succ[op]) {
-            depth[v] = std::max(depth[v], depth[op] + 1);
-            if (--degree[v] == 0) ready.push(v);
+// 输入是各组包含的操作列表；此处不决定分核，也不改变组内给定顺序。
+// 先建立操作到组的映射，再汇总依赖、涉及张量和各管道计算量，最后求拓扑序与后续工作量。
+// 初始化和搜索都调用这里；返回的 Partition 已完整，不需要 finish() 再补字段。
+// 重复、遗漏的操作或成环分组不能作为完整方案返回。
+Partition make_partition(const Problem &problem, std::vector<std::vector<int>> group_ops) {
+    Partition partition;
+    partition.groups.resize(group_ops.size());
+    partition.op_group.assign(problem.ops.size(), -1);
+    for (int index = 0; index < static_cast<int>(group_ops.size()); ++index) {
+        if (group_ops[index].empty()) {
+            throw NoPlan("empty group");
+        }
+        auto &group = partition.groups[index];
+        group.ops = std::move(group_ops[index]);
+        for (int op : group.ops) {
+            if (op < 0 || op >= static_cast<int>(problem.ops.size()) || problem.ops[op].copy ||
+                partition.op_group[op] != -1) {
+                throw NoPlan("invalid group membership");
+            }
+            partition.op_group[op] = index;
         }
     }
-    if (result.size() != g.work.size()) throw std::invalid_argument("compute dependency cycle");
-    if (!depth_first) return result;
-    const auto less = [&depth](int a, int b) {
-        if (depth[a] != depth[b]) return depth[a] < depth[b];
-        return a > b;
-    };
-    std::vector<int> stack;
-    for (int op : g.work) if (g.succ[op].empty()) stack.push_back(op);
-    std::sort(stack.begin(), stack.end(), less);
-    std::vector<char> done(g.ops.size());
-    result.clear();
-    while (!stack.empty()) {
-        const int op = stack.back();
-        if (done[op]) { stack.pop_back(); continue; }
-        std::vector<int> predecessors;
-        for (int p : g.pred[op]) if (!done[p]) predecessors.push_back(p);
-        if (predecessors.empty()) { result.push_back(op); done[op] = 1; stack.pop_back(); }
-        else {
-            std::sort(predecessors.begin(), predecessors.end(), less);
-            stack.insert(stack.end(), predecessors.begin(), predecessors.end());
+    // 按输入操作索引累计，保留初始化的浮点累加顺序。
+    for (int op = 0; op < static_cast<int>(problem.ops.size()); ++op) {
+        if (problem.ops[op].copy) {
+            continue;
+        }
+        int index = partition.op_group[op];
+        if (index < 0) {
+            throw NoPlan("ungrouped compute operation");
+        }
+        auto &group = partition.groups[index];
+        const auto &operation = problem.ops[op];
+        group.load[operation.pipe] += operation.cycles;
+        group.tensors.insert(group.tensors.end(), operation.inputs.begin(), operation.inputs.end());
+        group.tensors.insert(group.tensors.end(), operation.outputs.begin(), operation.outputs.end());
+        for (int next : operation.succs) {
+            int target = partition.op_group[next];
+            if (target < 0) {
+                throw NoPlan("ungrouped successor");
+            }
+            if (index != target) {
+                group.succs.push_back(target);
+                partition.groups[target].preds.push_back(index);
+            }
         }
     }
-    return result;
+    std::vector<std::vector<int>> adjacency(partition.groups.size());
+    for (std::size_t index = 0; index < partition.groups.size(); ++index) {
+        auto &group = partition.groups[index];
+        unique(group.preds);
+        unique(group.succs);
+        unique(group.tensors);
+        group.work = *std::max_element(group.load.begin(), group.load.end());
+        adjacency[index] = group.succs;
+    }
+    partition.topo = topological(adjacency);
+    for (auto it = partition.topo.rbegin(); it != partition.topo.rend(); ++it) {
+        auto &group = partition.groups[*it];
+        for (int next : group.succs) {
+            group.rank = std::max(group.rank, partition.groups[next].rank);
+        }
+        group.rank += group.work;
+    }
+    return partition;
 }
 
-bool valid_plan(const Graph& g, const Plan& plan) {
-    if (plan.orders.size() < 2 || plan.orders.size() > 5) return false;
-    std::vector<int> owner(g.ops.size(), -1);
-    std::vector<std::vector<int>> next = g.succ;
-    std::size_t total = 0;
-    for (int core = 0; core < static_cast<int>(plan.orders.size()); ++core) {
-        const auto& order = plan.orders[core];
-        int last = -1;
-        for (int op : order) {
-            if (op < 0 || op >= static_cast<int>(g.ops.size()) || g.ops[op].copy || owner[op] >= 0) return false;
-            owner[op] = core; ++total;
-            if (last != -1) next[last].push_back(op);
-            last = op;
-        }
-    }
-    if (total != g.work.size()) return false;
-    for (const auto& tensor : g.tensors) {
-        int writer_core = -1;
-        for (int op : tensor.producers) if (!g.ops[op].copy) {
-            if (writer_core >= 0 && owner[op] != writer_core) return false;
-            writer_core = owner[op];
-        }
-    }
-    for (auto& list : next) unique_sort(list);
-    try { check_dag(next); } catch (const std::invalid_argument&) { return false; }
-    return true;
-}
+// 为初始化建立较少、便于分核的计算组；返回完整 Partition，不修改输入图。
+// 先合并共享写者以满足同核约束，再合并因收缩产生的组间环，最后合并短的连续依赖链。
+// 前两步处理约束，短链合并是为了减少候选构造的规模，并非题目强制要求。
+// 最后按原图拓扑顺序整理各组操作，交给 make_partition() 统一生成分组信息。
+// 这些只是初始计算组，后续搜索允许重新切分，不要求一个组始终连续执行。
+Partition build_groups(const Problem &g) {
+    const int n = static_cast<int>(g.ops.size());
+    DSU d(n);
 
-void write_plan(const Graph& g, const Plan& plan, const std::filesystem::path& output) {
-    Json mapping = Json::object(), schedules = Json::array();
-    for (int op : g.work) mapping[std::to_string(g.ops[op].id)] = op;
-    for (const auto& order : plan.orders) schedules.push_back(order);
-    const Json result{{"node_to_subgraph", std::move(mapping)}, {"core_schedules", std::move(schedules)}};
-    if (!output.parent_path().empty()) std::filesystem::create_directories(output.parent_path());
-    auto temporary = output;
-    temporary += ".npu_sched.tmp";
-    for (std::uint64_t suffix = 1; std::filesystem::exists(temporary) || std::filesystem::is_symlink(temporary); ++suffix) {
-        temporary = output;
-        temporary += ".npu_sched.tmp." + std::to_string(suffix);
-    }
-    try {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) throw std::runtime_error("cannot create output file");
-        out << result.dump(2) << '\n';
-        out.flush();
-        if (!out) throw std::runtime_error("failed to write the complete plan");
-        out.close();
-        if (!out) throw std::runtime_error("failed to close output file");
-        std::error_code ec;
-        std::filesystem::rename(temporary, output, ec);
-        if (ec) {
-            // Windows 重命名不能直接覆盖已有文件。
-            if (std::filesystem::is_regular_file(output)) std::filesystem::remove(output);
-            std::filesystem::rename(temporary, output);
+    // 1. 合并同一张量的写者，保证它们同核。
+    for (const auto &t : g.tensors) {
+        for (std::size_t i = 1; i < t.producers.size(); ++i) {
+            d.join(t.producers[0], t.producers[i]);
         }
-    } catch (...) {
-        std::error_code ec;
-        std::filesystem::remove(temporary, ec);
-        throw;
     }
+
+    // 2. 建立组间依赖，合并成环的组。
+    std::vector<std::vector<int>> adj(n), rev(n);
+    for (int u = 0; u < n; ++u) {
+        if (!g.ops[u].copy) {
+            for (int v : g.ops[u].succs) {
+                int a = d.find(u), b = d.find(v);
+                if (a != b) {
+                    adj[a].push_back(b);
+                    rev[b].push_back(a);
+                }
+            }
+        }
+    }
+    for (auto &v : adj) {
+        unique(v);
+    }
+    for (auto &v : rev) {
+        unique(v);
+    }
+    std::vector<char> seen(n);
+    std::vector<int> finish;
+    for (int s = 0; s < n; ++s) {
+        if (!g.ops[s].copy && d.find(s) == s && !seen[s]) {
+            std::vector<std::pair<int, std::size_t>> st{{s, 0}};
+            seen[s] = 1;
+            while (!st.empty()) {
+                int u = st.back().first;
+                auto &j = st.back().second;
+                if (j < adj[u].size()) {
+                    int v = adj[u][j++];
+                    if (!seen[v]) {
+                        seen[v] = 1;
+                        st.emplace_back(v, 0);
+                    }
+                } else {
+                    finish.push_back(u);
+                    st.pop_back();
+                }
+            }
+        }
+    }
+    std::fill(seen.begin(), seen.end(), 0);
+    for (auto it = finish.rbegin(); it != finish.rend(); ++it) {
+        if (!seen[*it]) {
+            int root = *it;
+            std::vector<int> st{root};
+            seen[root] = 1;
+            while (!st.empty()) {
+                int u = st.back();
+                st.pop_back();
+                d.join(root, u);
+                for (int v : rev[u]) {
+                    if (!seen[v]) {
+                        seen[v] = 1;
+                        st.push_back(v);
+                    }
+                }
+            }
+        }
+    }
+    // 3. 重建组间依赖，合并单出边、单入边的短链（仅合并总数不超过 64 的组）。
+    adj.assign(n, {});
+    rev.assign(n, {});
+    for (int u = 0; u < n; ++u) {
+        if (!g.ops[u].copy) {
+            for (int v : g.ops[u].succs) {
+                int a = d.find(u), b = d.find(v);
+                if (a != b) {
+                    adj[a].push_back(b);
+                    rev[b].push_back(a);
+                }
+            }
+        }
+    }
+    for (auto &v : adj) {
+        unique(v);
+    }
+    for (auto &v : rev) {
+        unique(v);
+    }
+
+    for (int u = 0; u < n; ++u) {
+        if (adj[u].size() == 1) {
+            int v = adj[u][0];
+            int a = d.find(u), b = d.find(v);
+            if (rev[v].size() == 1 && a != b && d.size[a] + d.size[b] <= 64) {
+                d.join(a, b);
+            }
+        }
+    }
+    // 收集操作列表，再统一构造完整分组。
+    std::vector<std::vector<int>> group_ops;
+    std::unordered_map<int, int> index;
+    for (int u = 0; u < n; ++u) {
+        if (!g.ops[u].copy) {
+            int root = d.find(u);
+            auto inserted = index.emplace(root, static_cast<int>(group_ops.size()));
+            if (inserted.second) {
+                group_ops.emplace_back();
+            }
+            group_ops[inserted.first->second].push_back(u);
+        }
+    }
+    std::vector<int> op_position(n);
+    for (int i = 0; i < static_cast<int>(g.op_topo.size()); ++i) {
+        op_position[g.op_topo[i]] = i;
+    }
+    // 初始分组保持原图拓扑顺序；搜索候选保持其提交顺序。
+    for (auto &ops : group_ops) {
+        std::sort(ops.begin(), ops.end(), [&](int a, int b) { return op_position[a] < op_position[b]; });
+    }
+    return make_partition(g, std::move(group_ops));
 }
-} // npu 命名空间
+}

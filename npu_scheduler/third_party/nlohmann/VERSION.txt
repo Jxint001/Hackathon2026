@@ -1,5 +1,0 @@
-nlohmann/json 3.11.3
-Source: https://github.com/nlohmann/json/releases/tag/v3.11.3
-Vendored distribution: single_include/nlohmann/json.hpp (complete single-header library)
-License: MIT; see LICENSE.MIT and the copyright notice in json.hpp.
-Use: JSON parsing and serialization only.
