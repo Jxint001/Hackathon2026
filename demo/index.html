@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="用两个真实用例的简化图，逐步回放多核调度初始解构造与局部搜索。">
+  <title>从初始解到更优解 · NPU 调度演示</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#" aria-label="返回演示起点"><span class="brand-icon">◈</span> NPU <span>调度实验室</span></a>
+  <div class="top-meta"><span class="live-dot"></span> 已保存结果回放 <span class="separator">/</span><span id="core-config">统一 2 核（核 0、核 1）</span></div>
+</header>
+<main>
+  <section class="intro">
+    <div><div class="eyebrow">ALGORITHM WALKTHROUGH <span>00 → 02</span></div><h1>从初始解，到更优解<span>。</span></h1><p>看清初始解如何构造，再回放两张图中原代码的搜索决策。</p></div>
+    <div class="case-switch" aria-label="演示用例"><button data-case="0" class="active"><small>CASE 05</small>矩阵乘加 <span>27 ops</span></button><button data-case="1"><small>CASE 08</small>卷积与向量 <span>26 ops</span></button></div>
+  </section>
+  <div class="case-note"><span class="tag">真实用例 · 简化图</span><span id="case-note"></span><button id="provenance-button" class="text-button" aria-expanded="false">查看缩图说明 ↗</button></div>
+  <div id="provenance" class="provenance" hidden></div>
+  <nav class="chapters" aria-label="演示章节">
+    <button data-tab="-1" class="active"><span>00</span><div>DAG 如何划分子图<small>逐次合并，解释每个子图的来源</small></div></button>
+    <button data-tab="0"><span>01</span><div>构造初始解<small>看清每一步为什么选这个核</small></div></button>
+    <button data-tab="1"><span>02</span><div>局部搜索<small>按图结构回放原搜索策略</small></div></button>
+    <div id="chapter-summary" class="chapter-summary"></div>
+  </nav>
+  <section class="workspace">
+    <div class="visual-column">
+      <section id="grid-explainer" class="panel grid-explainer" hidden aria-label="DAG 与输出单元网格的对应关系">
+        <div class="panel-heading"><div><span class="section-number">DAG ↔ GRID</span><h2>DAG 与网格：同一批操作的两种视图</h2></div></div>
+        <p class="grid-intro">每格代表一条乘加链及其结果张量。代码按共享输入识别行列关系，再对这些链分块；没有计算或还原矩阵的数值。</p>
+        <div class="grid-demo-controls"><button id="grid-single">查看 1×1 分块</button><button id="grid-multi">查看多单元分块</button><span>切换的是原代码实际尝试的候选</span></div>
+        <p id="grid-layout-note" class="grid-layout-note"></p>
+        <div class="grid-map-scroll"><svg id="grid-map" role="group" aria-label="点击输出单元查看其在 DAG 中的操作链"></svg></div>
+        <div id="grid-chain" class="grid-chain"></div>
+        <div id="grid-tile-order" class="grid-tile-order"></div>
+        <p class="grid-footnote">网格是组织计算的视图；下面仍保留完整 DAG。每个格子代表一个结果张量，可以是张量块，不表示一个标量数值。</p>
+      </section>
+      <div class="panel graph-panel">
+        <div class="panel-heading"><div><span class="section-number">GRAPH</span><h2 id="graph-title">计算图与初始子图</h2></div><div id="graph-legend" class="legend"><span><i class="c0"></i>核 0</span><span><i class="c1"></i>核 1</span></div></div>
+        <div class="dag-controls"><div class="view-switch"><button id="view-dag" class="active">初始 DAG · 含张量</button><button id="view-grouped">计算依赖与子图划分</button></div><div id="dag-options"><label><input id="expand-boundaries" type="checkbox"> 展开 COPY / DDR</label><button id="dag-fit" title="缩放到图区域宽度">适应宽度</button><button id="dag-minus" aria-label="缩小 DAG">−</button><button id="dag-reset" title="恢复原始尺寸">100%</button><button id="dag-plus" aria-label="放大 DAG">＋</button></div></div>
+        <div class="graph-toolbar"><span id="graph-caption"></span><label id="group-option"><input id="show-groups" type="checkbox" checked> 显示子图划分</label></div>
+        <div id="dag-guide" class="dag-guide"></div>
+        <div id="graph-wrap" class="graph-wrap"><svg id="graph" role="img" aria-label="计算操作依赖图"></svg></div>
+        <div id="node-detail" class="node-detail">点击操作，查看操作名称、计算周期、依赖和共享张量。</div>
+      </div>
+      <div class="panel queues-panel"><div class="panel-heading"><div><span class="section-number">PLACEMENT</span><h2 id="queue-title">各核心的子图顺序</h2></div><span class="hint">框表示子图 · 横向阅读</span></div><div id="queues"></div><p id="queue-note" class="queue-note"></p></div>
+    </div>
+    <aside id="explanation" class="panel explanation" aria-label="算法步骤详情">
+      <div id="detail"></div>
+      <div class="playback"><div class="playback-top"><span id="step-label"></span><button id="reset" class="text-button">↺ 重置</button></div><input id="scrubber" type="range" min="0" value="0" aria-label="演示步骤"><div class="playback-buttons"><button id="prev" aria-label="上一步">← 上一步</button><button id="play" class="primary">▶ 自动演示</button><button id="next" aria-label="下一步">下一步 →</button></div></div>
+    </aside>
+  </section>
+  <section id="search-overview" class="panel search-overview" hidden aria-label="搜索方案概述">
+    <div class="panel-heading"><div><span class="section-number">SEARCH OVERVIEW</span><h2>搜索方案概述</h2></div></div>
+    <ol class="search-overview-steps">
+      <li><h3>设定搜索 budget</h3><p>按计算图规模设定阶段候选尝试上限：120～900 次。<strong id="search-budget-note"></strong></p><p>进入新阶段重新计数；网格分块与粒度调整共用额度，多起点另计。</p></li>
+      <li><h3>顺序调用策略</h3><p>按代码的固定顺序调用策略，不适用当前图结构的阶段直接跳过。</p><p>每个阶段尝试多个候选，将当前最优解传给后续阶段；为控制开销，主流程不反复轮换全部策略。</p></li>
+      <li><h3>候选评估与停止规则</h3><p>候选去重后，利用缓存或检查资源下界，再按需完整模拟；按完成时间优先、搬运量次优决定是否接受。</p><p>各策略受候选额度、枚举范围和轮数等条件限制，按原流程结束搜索。</p></li>
+    </ol>
+    <details class="search-overview-more"><summary>查看实际策略顺序与预算计数</summary><p>网格分块＋子图粒度 → 生产者延后 → 容量分块 → 空间分区 → 对齐条带 → 链迁移 → 矩阵多起点 → 混合管道顺序优化（含分层重排）→ 多起点精修。</p><p>同阶段重复候选不计数；下界剪枝和缓存命中仍计一次尝试。budget 是候选次数上限，不是总运行时间或模拟器调用总数上限。</p></details>
+  </section>
+  <section class="panel evidence"><div class="panel-heading"><div><span class="section-number" id="evidence-kicker">REVIEW</span><h2 id="evidence-title">初始候选的完整复核</h2></div><div id="evidence-controls"></div></div><div id="evidence-body"></div></section>
+  <footer><span>固定结果 · 逐步回放 · 离线可用</span><span>L1 1.5 MiB <b>·</b> UB 128 KiB <b>·</b> DDR 60 B/cycle <b>·</b> 跨核等待 1000 cycles</span></footer>
+</main>
+<script src="examples/case05_2cores/playback.js"></script>
+<script src="examples/case08_2cores/playback.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
